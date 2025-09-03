@@ -1,0 +1,63 @@
+name: Deploy to Cloud Run
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  SERVICE_NAME: main-street-migrator
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auth via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Set project
+        run: gcloud config set project "${{ vars.GCP_PROJECT }}"
+
+      - name: Build frontend if present
+        run: |
+          if [ -d main-street-migrator-frontend ]; then
+            sudo apt-get update && sudo apt-get install -y nodejs npm
+            (cd main-street-migrator-frontend && npm ci && npm run build)
+            mkdir -p static
+            cp -r main-street-migrator-frontend/dist/* static/ || true
+          fi
+
+      - name: Build image with Cloud Build
+        run: |
+          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/${{ vars.AR_REPO }}/${{ env.SERVICE_NAME }}:${{ github.sha }}"
+          echo "IMAGE=${IMAGE}" >> $GITHUB_ENV
+          gcloud builds submit --tag "${IMAGE}" .
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy "${{ env.SERVICE_NAME }}" \
+            --image "${{ env.IMAGE }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --platform managed \
+            --allow-unauthenticated \
+            --port 8080 \
+            --set-env-vars SECRET_KEY=auto,FLASK_ENV=production,DB_URL=sqlite:////tmp/app.db${{ (secrets.OPENAI_API_KEY && ',OPENAI_API_KEY=' ) || '' }}${{ secrets.OPENAI_API_KEY }}${{ (secrets.OPENAI_API_BASE && ',OPENAI_API_BASE=' ) || '' }}${{ secrets.OPENAI_API_BASE }}
+
+      - name: Health check
+        run: |
+          URL="$(gcloud run services describe "${{ env.SERVICE_NAME }}" --region "${{ vars.GCP_REGION }}" --format='value(status.url)')"
+          echo "URL=$URL"
+          curl -fsS "$URL/api/health"

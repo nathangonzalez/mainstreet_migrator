@@ -1,0 +1,108 @@
+name: Deploy to Cloud Run
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      image_digest:
+        description: 'Image digest for rollback (optional)'
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  SERVICE_NAME: main-street-migrator
+  AR_REPO: main-street-migrator
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auth via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Configure Artifact Registry docker auth
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev
+
+      - name: Build Docker image
+        run: |
+          IMAGE=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/${{ env.SERVICE_NAME }}:${{ github.sha }}
+          docker build -t $IMAGE .
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+
+      - name: Push to Artifact Registry
+        run: docker push ${{ env.IMAGE }}
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image ${{ env.IMAGE }} \
+            --region ${{ vars.GCP_REGION }} \
+            --platform managed \
+            --port 5003 \
+            --allow-unauthenticated \
+            --service-account=msm-runtime@${{ vars.GCP_PROJECT_ID }}.iam.gserviceaccount.com \
+            --min-instances=0 --max-instances=3 \
+            --cpu=1 --memory=512Mi \
+            --set-secrets OPENAI_API_KEY=OPENAI_API_KEY:latest
+
+      - name: Output the service URL
+        run: |
+          URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} --region ${{ vars.GCP_REGION }} --format='value(status.url)')
+          echo "Service URL: $URL"
+          echo "SERVICE_URL=$URL" >> $GITHUB_ENV
+
+      - name: Smoke test
+        run: |
+          curl -f ${{ env.SERVICE_URL }}/api/health
+
+      - name: Store deployed image digest as an artifact
+        run: |
+          DIGEST=$(docker inspect ${{ env.IMAGE }} --format='{{index .RepoDigests 0}}' | cut -d'@' -f2)
+          echo $DIGEST > image_digest.txt
+          echo "Deployed image digest: $DIGEST"
+
+  rollback:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.image_digest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auth via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Rollback to previous digest
+        run: |
+          IMAGE=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/${{ env.SERVICE_NAME }}@${{ github.event.inputs.image_digest }}
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image $IMAGE \
+            --region ${{ vars.GCP_REGION }} \
+            --platform managed \
+            --port 5003 \
+            --allow-unauthenticated \
+            --service-account=msm-runtime@${{ vars.GCP_PROJECT_ID }}.iam.gserviceaccount.com \
+            --min-instances=0 --max-instances=3 \
+            --cpu=1 --memory=512Mi
